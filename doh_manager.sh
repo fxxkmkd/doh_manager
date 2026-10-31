@@ -12,154 +12,8 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-# ================= 1. 严格架构与系统检测 =================
-OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
-if [ "$OS_TYPE" != "linux" ]; then
-  echo -e "${RED}[-] 本脚本仅支持 Linux 系统，当前为: $OS_TYPE${PLAIN}"
-  exit 1
-fi
-
-RAW_ARCH=$(uname -m)
-case "$RAW_ARCH" in
-  x86_64|amd64)
-    SYS_ARCH="amd64"
-    ARCH_MATCH_REGEX="(amd64|x86_64)"
-    ;;
-  aarch64|arm64)
-    SYS_ARCH="arm64"
-    ARCH_MATCH_REGEX="(arm64|aarch64)"
-    ;;
-  armv7*|armhf)
-    SYS_ARCH="armv7"
-    ARCH_MATCH_REGEX="(armv7|armhf)"
-    ;;
-  i386|i686)
-    SYS_ARCH="386"
-    ARCH_MATCH_REGEX="(386|x86)"
-    ;;
-  *)
-    echo -e "${RED}[-] 无法识别的系统架构: $RAW_ARCH${PLAIN}"
-    exit 1
-    ;;
-esac
-
-echo -e "${GREEN}[+] 系统识别完成 -> OS: Linux | CPU 架构: ${RAW_ARCH} (匹配标签: ${SYS_ARCH})${PLAIN}"
-
-install_deps() {
-  echo -e "${YELLOW}[*] 安装基础工具 (curl, tar, lsof, file, dnsutils)...${PLAIN}"
-  if command -v apt-get &>/dev/null; then
-    apt-get update -qq && apt-get install -y -qq curl tar bzip2 xz-utils lsof file dnsutils &>/dev/null
-  elif command -v yum &>/dev/null; then
-    yum install -y curl tar bzip2 xz lsof file bind-utils &>/dev/null
-  fi
-}
-
-get_github_asset_url() {
-  local repo="$1"
-  local bin_name="$2"
-
-  local latest_loc
-  latest_loc=$(curl -sSI -m 6 "https://github.com/${repo}/releases/latest" 2>/dev/null | grep -i "^location:" | awk '{print $2}' | tr -d '\r\n')
-  
-  if [ -z "$latest_loc" ]; then
-    echo ""
-    return 1
-  fi
-
-  local tag="${latest_loc##*/}"
-  local assets_page="https://github.com/${repo}/releases/expanded_assets/${tag}"
-
-  local matched_path
-  matched_path=$(curl -sSL -m 8 "$assets_page" 2>/dev/null \
-    | grep -oE "/${repo}/releases/download/[^\"]+" \
-    | grep -Ei "linux" \
-    | grep -Ei "$ARCH_MATCH_REGEX" \
-    | grep -Eiv "(darwin|windows|freebsd|openbsd|\.sha|\.sig|\.asc|\.deb|\.rpm|\.apk|\.txt)" \
-    | head -n 1)
-
-  if [ -n "$matched_path" ]; then
-    echo "https://github.com${matched_path}"
-  else
-    echo ""
-    return 1
-  fi
-}
-
-universal_download_and_install() {
-  local download_url="$1"
-  local target_bin_name="$2"
-  local test_args="$3"
-  local tmp_file="/tmp/doh_pkg_temp"
-  local extract_dir="/tmp/doh_ext_temp"
-
-  rm -rf "$tmp_file" "$extract_dir"
-  mkdir -p "$extract_dir"
-
-  echo -e "${YELLOW}[*] 正在下载针对 [Linux-${SYS_ARCH}] 的专属发布包:${PLAIN}"
-  echo -e "    ${download_url}"
-
-  if ! curl -fL --retry 3 --connect-timeout 8 -m 120 -o "$tmp_file" "$download_url"; then
-    echo -e "${RED}[-] 下载失败，请检查网络。${PLAIN}"
-    return 1
-  fi
-
-  local file_type
-  file_type=$(file "$tmp_file" 2>/dev/null || true)
-
-  if echo "$file_type" | grep -Ei -q "(gzip|bzip2|xz|tar|archive)"; then
-    tar -xf "$tmp_file" -C "$extract_dir" >/dev/null
-    local found_bin
-    found_bin=$(find "$extract_dir" -type f -name "$target_bin_name" | head -n 1)
-    if [ -z "$found_bin" ]; then
-      found_bin=$(find "$extract_dir" -type f -executable | head -n 1)
-    fi
-    mv "$found_bin" "/usr/local/bin/${target_bin_name}"
-  elif echo "$file_type" | grep -qi "executable"; then
-    mv "$tmp_file" "/usr/local/bin/${target_bin_name}"
-  else
-    echo -e "${RED}[-] 下载的内容不是有效的可执行文件格式: ${file_type}${PLAIN}"
-    rm -rf "$tmp_file" "$extract_dir"
-    return 1
-  fi
-
-  chmod +x "/usr/local/bin/${target_bin_name}"
-  rm -rf "$tmp_file" "$extract_dir"
-
-  echo -e "${YELLOW}[*] 校验二进制与当前 CPU 架构兼容性...${PLAIN}"
-  if ! "/usr/local/bin/${target_bin_name}" ${test_args} &>/dev/null; then
-    echo -e "${RED}[FATAL] 二进制文件无法正常执行，属性如下：${PLAIN}"
-    file "/usr/local/bin/${target_bin_name}"
-    rm -f "/usr/local/bin/${target_bin_name}"
-    return 1
-  fi
-
-  echo -e "${GREEN}[+] 校验通过！/usr/local/bin/${target_bin_name} 架构完全匹配。${PLAIN}"
-}
-
-release_port_53() {
-  echo -e "${YELLOW}[*] 清理本地 53 端口占用与旧服务...${PLAIN}"
-  if lsof -i :53 2>/dev/null | grep -qi "systemd-resolve"; then
-    echo -e "${YELLOW}[!] 停用 systemd-resolved 53 端口 stub 监听...${PLAIN}"
-    if [ -f /etc/resolv.conf ]; then
-      sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf 2>/dev/null || true
-    fi
-    mkdir -p /etc/systemd/resolved.conf.d/
-    echo -e "[Resolve]\nDNSStubListener=no" > /etc/systemd/resolved.conf.d/disable-stub.conf
-    systemctl restart systemd-resolved 2>/dev/null || true
-  fi
-  systemctl stop dnsproxy cloudflared-dns 2>/dev/null || true
-}
-
-setup_resolv() {
-  echo -e "${YELLOW}[*] 配置系统 DNS 指向 127.0.0.1...${PLAIN}"
-  chattr -i /etc/resolv.conf 2>/dev/null || true
-  [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-  cat << RESOLV_EOF > /etc/resolv.conf
-nameserver 127.0.0.1
-options timeout:2 attempts:3
-RESOLV_EOF
-  echo -e "${GREEN}[+] /etc/resolv.conf 已锁定指向 127.0.0.1${PLAIN}"
-}
+CONFIG_FILE="/etc/doh_custom.env"
+ENV_CHECKED=0
 
 # ================= 13 个 DoH 节点配置 =================
 declare -A DOH_URLS=(
@@ -194,7 +48,172 @@ declare -A DOH_DESCS=(
   [13]="Cisco SSE 专用 DoH 域名        -> https://dns.sse.cisco.com/dns-query"
 )
 
-CONFIG_FILE="/etc/doh_custom.env"
+# ================= 安装前单次环境与依赖检测 =================
+prepare_install_env() {
+  if [ "$ENV_CHECKED" -eq 1 ]; then
+    return 0
+  fi
+
+  echo -e "${YELLOW}[*] 正在执行安装前环境与依赖检查...${PLAIN}"
+
+  OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
+  if [ "$OS_TYPE" != "linux" ]; then
+    echo -e "${RED}[-] 本脚本仅支持 Linux 系统，当前为: $OS_TYPE${PLAIN}"
+    exit 1
+  fi
+
+  RAW_ARCH=$(uname -m)
+  case "$RAW_ARCH" in
+    x86_64|amd64)
+      SYS_ARCH="amd64"
+      CF_ARCH="amd64"
+      ARCH_MATCH_REGEX="(amd64|x86_64)"
+      ;;
+    aarch64|arm64)
+      SYS_ARCH="arm64"
+      CF_ARCH="arm64"
+      ARCH_MATCH_REGEX="(arm64|aarch64)"
+      ;;
+    armv7*|armhf)
+      SYS_ARCH="armv7"
+      CF_ARCH="arm"
+      ARCH_MATCH_REGEX="(armv7|armhf)"
+      ;;
+    i386|i686)
+      SYS_ARCH="386"
+      CF_ARCH="386"
+      ARCH_MATCH_REGEX="(386|x86)"
+      ;;
+    *)
+      echo -e "${RED}[-] 无法识别的系统架构: $RAW_ARCH${PLAIN}"
+      exit 1
+      ;;
+  esac
+
+  local missing_cmds=()
+  for cmd in curl tar lsof file dig; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing_cmds+=("$cmd")
+    fi
+  done
+
+  if [ ${#missing_cmds[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[*] 检测到缺失基础工具 (${missing_cmds[*]})，正在自动安装...${PLAIN}"
+    if command -v apt-get &>/dev/null; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar bzip2 xz-utils lsof file dnsutils </dev/null >/dev/null
+    elif command -v yum &>/dev/null; then
+      yum install -y -q curl tar bzip2 xz lsof file bind-utils </dev/null >/dev/null
+    fi
+  fi
+
+  ENV_CHECKED=1
+  echo -e "${GREEN}[+] 环境检查通过 -> OS: Linux | CPU 架构: ${RAW_ARCH} (${SYS_ARCH})${PLAIN}"
+}
+
+get_github_asset_url() {
+  local repo="$1"
+
+  local latest_loc
+  latest_loc=$(curl -sSI -m 6 "https://github.com/${repo}/releases/latest" 2>/dev/null | grep -i "^location:" | awk '{print $2}' | tr -d '\r\n' || true)
+
+  if [ -z "$latest_loc" ]; then
+    return 1
+  fi
+
+  local tag="${latest_loc##*/}"
+  local assets_page="https://github.com/${repo}/releases/expanded_assets/${tag}"
+
+  local matched_path
+  matched_path=$(curl -sSL -m 8 "$assets_page" 2>/dev/null \
+    | grep -oE "/${repo}/releases/download/[^\"]+" \
+    | grep -Ei "linux" \
+    | grep -Ei "$ARCH_MATCH_REGEX" \
+    | grep -Eiv "(darwin|windows|freebsd|openbsd|\.sha|\.sig|\.asc|\.deb|\.rpm|\.apk|\.txt)" \
+    | head -n 1 || true)
+
+  if [ -n "$matched_path" ]; then
+    echo "https://github.com${matched_path}"
+    return 0
+  fi
+  return 1
+}
+
+universal_download_and_install() {
+  local download_url="$1"
+  local target_bin_name="$2"
+  local test_args="$3"
+  local tmp_file="/tmp/doh_pkg_temp"
+  local extract_dir="/tmp/doh_ext_temp"
+
+  rm -rf "$tmp_file" "$extract_dir"
+  mkdir -p "$extract_dir"
+
+  echo -e "${YELLOW}[*] 正在下载针对 [Linux-${SYS_ARCH}] 的专属发布包:${PLAIN}"
+  echo -e "    ${download_url}"
+
+  if ! curl -fL --retry 3 --connect-timeout 8 -m 120 -o "$tmp_file" "$download_url"; then
+    echo -e "${RED}[-] 下载失败，请检查网络。${PLAIN}"
+    rm -rf "$tmp_file" "$extract_dir"
+    return 1
+  fi
+
+  local file_type
+  file_type=$(file "$tmp_file" 2>/dev/null || true)
+
+  if echo "$file_type" | grep -Ei -q "(gzip|bzip2|xz|tar|archive)"; then
+    tar -xf "$tmp_file" -C "$extract_dir" >/dev/null
+    local found_bin
+    found_bin=$(find "$extract_dir" -type f -name "$target_bin_name" | head -n 1)
+    if [ -z "$found_bin" ]; then
+      found_bin=$(find "$extract_dir" -type f -executable | head -n 1)
+    fi
+    mv -f "$found_bin" "/usr/local/bin/${target_bin_name}"
+  elif echo "$file_type" | grep -qi "executable"; then
+    mv -f "$tmp_file" "/usr/local/bin/${target_bin_name}"
+  else
+    echo -e "${RED}[-] 下载的内容不是有效的可执行文件格式: ${file_type}${PLAIN}"
+    rm -rf "$tmp_file" "$extract_dir"
+    return 1
+  fi
+
+  chmod +x "/usr/local/bin/${target_bin_name}"
+  rm -rf "$tmp_file" "$extract_dir"
+
+  if ! "/usr/local/bin/${target_bin_name}" ${test_args} &>/dev/null; then
+    echo -e "${RED}[FATAL] 二进制文件无法正常执行，文件属性如下：${PLAIN}"
+    file "/usr/local/bin/${target_bin_name}"
+    rm -f "/usr/local/bin/${target_bin_name}"
+    return 1
+  fi
+
+  echo -e "${GREEN}[+] /usr/local/bin/${target_bin_name} 安装就绪。${PLAIN}"
+}
+
+release_port_53() {
+  echo -e "${YELLOW}[*] 清理本地 53 端口占用与旧服务...${PLAIN}"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null || lsof -i :53 -n -P 2>/dev/null | grep -qi "systemd-r"; then
+    echo -e "${YELLOW}[!] 停用 systemd-resolved 53 端口 stub 监听...${PLAIN}"
+    if [ -f /etc/systemd/resolved.conf ]; then
+      sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf 2>/dev/null || true
+    fi
+    mkdir -p /etc/systemd/resolved.conf.d/
+    printf "[Resolve]\nDNSStubListener=no\n" > /etc/systemd/resolved.conf.d/disable-stub.conf
+    systemctl restart systemd-resolved 2>/dev/null || true
+  fi
+  systemctl stop dnsproxy doh-client cloudflared-dns 2>/dev/null || true
+}
+
+setup_resolv() {
+  echo -e "${YELLOW}[*] 配置系统 DNS 指向 127.0.0.1...${PLAIN}"
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+  [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+  cat << RESOLV_EOF > /etc/resolv.conf
+nameserver 127.0.0.1
+options timeout:2 attempts:3
+RESOLV_EOF
+  echo -e "${GREEN}[+] /etc/resolv.conf 已锁定指向 127.0.0.1${PLAIN}"
+}
 
 select_dns_pair() {
   while true; do
@@ -219,7 +238,7 @@ select_dns_pair() {
       echo -e "  - 节点 1: ${CYAN}${NODE1}${PLAIN}"
       echo -e "  - 节点 2: ${CYAN}${NODE2}${PLAIN}"
 
-      mkdir -p $(dirname "$CONFIG_FILE")
+      mkdir -p "$(dirname "$CONFIG_FILE")"
       cat << CONF_EOF > "$CONFIG_FILE"
 NODE1="${NODE1}"
 NODE2="${NODE2}"
@@ -227,26 +246,28 @@ ACTIVE_SERVICE="${CURRENT_SERVICE}"
 CONF_EOF
       break
     else
-      echo -e "${RED}[-] 输入格式有误！必须是 1 到 13 之间的两个序号且用逗号隔开（如 1,3）。${PLAIN}"
+      echo -e "${RED}[-] 输入格式有误！必须是 1 到 13 之间的两个序号且用英文逗号隔开（如 1,3）。${PLAIN}"
     fi
   done
 }
 
 # ================= 1. 部署 dnsproxy =================
 deploy_dnsproxy() {
+  prepare_install_env
   CURRENT_SERVICE="dnsproxy"
   select_dns_pair
-  release_port_53
 
   echo -e "${YELLOW}[*] 正在抓取 AdguardTeam/dnsproxy Linux-${SYS_ARCH} 官方包...${PLAIN}"
   local target_url
-  target_url=$(get_github_asset_url "AdguardTeam/dnsproxy" "dnsproxy")
+  target_url=$(get_github_asset_url "AdguardTeam/dnsproxy" || true)
 
   if [ -z "$target_url" ]; then
     target_url="https://github.com/AdguardTeam/dnsproxy/releases/download/v0.74.2/dnsproxy-linux-${SYS_ARCH}-v0.74.2.tar.gz"
   fi
 
+  # 先下载并校验二进制包，成功后再释放 53 端口，避免断网死锁
   universal_download_and_install "$target_url" "dnsproxy" "--version"
+  release_port_53
 
   cat << SERVICE_EOF > /etc/systemd/system/dnsproxy.service
 [Unit]
@@ -272,26 +293,15 @@ SERVICE_EOF
 
 # ================= 2. 部署 cloudflared =================
 deploy_cloudflared() {
+  prepare_install_env
   CURRENT_SERVICE="cloudflared-dns"
   select_dns_pair
-  release_port_53
 
   echo -e "${YELLOW}[*] 正在拉取支持 proxy-dns 功能的 cloudflared 稳定版本 (2024.12.0)...${PLAIN}"
-  local target_url="https://github.com/cloudflare/cloudflared/releases/download/2024.12.0/cloudflared-linux-${SYS_ARCH}"
+  local target_url="https://github.com/cloudflare/cloudflared/releases/download/2024.12.0/cloudflared-linux-${CF_ARCH}"
 
-  rm -f /usr/local/bin/cloudflared
-  if ! curl -fL --retry 3 --connect-timeout 8 -m 120 -o /usr/local/bin/cloudflared "$target_url"; then
-    echo -e "${RED}[-] cloudflared 下载失败，请检查网络。${PLAIN}"
-    return 1
-  fi
-  chmod +x /usr/local/bin/cloudflared
-
-  echo -e "${YELLOW}[*] 校验 cloudflared 执行能力...${PLAIN}"
-  if ! /usr/local/bin/cloudflared --version &>/dev/null; then
-    echo -e "${RED}[FATAL] cloudflared 二进制执行失败，架构可能不兼容。${PLAIN}"
-    file /usr/local/bin/cloudflared
-    return 1
-  fi
+  universal_download_and_install "$target_url" "cloudflared" "--version"
+  release_port_53
 
   echo -e "${YELLOW}[*] 配置上游域名直连映射，防止 Bootstrap 死锁...${PLAIN}"
   grep -q "cloudflare-dns.com" /etc/hosts || echo "1.1.1.1 cloudflare-dns.com" >> /etc/hosts
@@ -322,7 +332,6 @@ SERVICE_EOF
 
   systemctl daemon-reload
   systemctl enable --now cloudflared-dns
-  sleep 1
   setup_resolv
   echo -e "${GREEN}[+] cloudflared 部署成功并已启动！${PLAIN}"
 }
@@ -333,7 +342,7 @@ benchmark_all_doh() {
   echo -e "${CYAN}======================================================================${PLAIN}"
   echo -e "${CYAN}            全部 13 个主流 DoH 节点批量连通性与延迟测速               ${PLAIN}"
   echo -e "${CYAN}======================================================================${PLAIN}"
-  
+
   local DNS_QUERY="AAABAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ"
 
   printf "%-4s %-22s %-11s %-11s %-13s %-10s\n" "序号" "节点标识" "TCP握手" "TLS握手" "总响应(TTFB)" "状态"
@@ -359,7 +368,7 @@ benchmark_all_doh() {
     esac
 
     local metrics
-    metrics=$(curl -s -m 4 -o /dev/null \
+    metrics=$(LC_ALL=C curl -s -m 4 -o /dev/null \
       -H "accept: application/dns-message" \
       -w "%{time_connect} %{time_appconnect} %{time_total} %{http_code}" \
       "${url}?dns=${DNS_QUERY}" 2>/dev/null || echo "0 0 0 000")
@@ -369,9 +378,9 @@ benchmark_all_doh() {
 
     local tcp_str tls_str total_str status_str
     if [ "$code" = "200" ]; then
-      tcp_str=$(awk "BEGIN {printf \"%.1f ms\", $t_tcp * 1000}")
-      tls_str=$(awk "BEGIN {printf \"%.1f ms\", ($t_tls - $t_tcp) * 1000}")
-      total_str=$(awk "BEGIN {printf \"%.1f ms\", $t_total * 1000}")
+      tcp_str=$(LC_ALL=C awk "BEGIN {printf \"%.1f ms\", $t_tcp * 1000}")
+      tls_str=$(LC_ALL=C awk "BEGIN {diff = ($t_tls - $t_tcp) * 1000; if (diff < 0) diff = 0; printf \"%.1f ms\", diff}")
+      total_str=$(LC_ALL=C awk "BEGIN {printf \"%.1f ms\", $t_total * 1000}")
       status_str="${GREEN}200 OK${PLAIN}"
     elif [ "$code" = "000" ]; then
       tcp_str="--"
@@ -381,7 +390,7 @@ benchmark_all_doh() {
     else
       tcp_str="--"
       tls_str="--"
-      total_str=$(awk "BEGIN {printf \"%.1f ms\", $t_total * 1000}")
+      total_str=$(LC_ALL=C awk "BEGIN {printf \"%.1f ms\", $t_total * 1000}")
       status_str="${YELLOW}HTTP $code${PLAIN}"
     fi
 
@@ -391,12 +400,18 @@ benchmark_all_doh() {
   echo "----------------------------------------------------------------------"
   echo -e "${YELLOW}[*] 提示: 可根据上方测速结果，记住延迟最低的 2 个序号，在选项 1 或 2 部署时直接输入。${PLAIN}"
   echo ""
-  read -rp "按回车键返回主菜单..." dummy
+  read -rp "按回车键返回主菜单..." _
 }
 
 # ================= 4. 检测本机 DNS 解析连通性 =================
 test_dns_connectivity() {
-  clear
+  local mode="${1:-clear}"
+  if [ "$mode" != "no_clear" ]; then
+    clear
+  else
+    echo ""
+  fi
+
   echo -e "${CYAN}=======================================================${PLAIN}"
   echo -e "${CYAN}             实时 DNS 连通性与测速体检                 ${PLAIN}"
   echo -e "${CYAN}=======================================================${PLAIN}"
@@ -438,9 +453,9 @@ test_dns_connectivity() {
   for domain in "${test_domains[@]}"; do
     echo -n "  - 解析 [${domain}]: "
     if command -v dig &>/dev/null; then
-      DIG_RES=$(dig @127.0.0.1 "${domain}" +time=2 +tries=1 +stats 2>/dev/null || true)
+      DIG_RES=$(dig @127.0.0.1 "${domain}" A +time=2 +tries=2 +stats 2>/dev/null || true)
       Q_TIME=$(echo "$DIG_RES" | grep "Query time:" | awk '{print $4, $5}')
-      R_IP=$(echo "$DIG_RES" | grep -A 1 "ANSWER SECTION:" | tail -n 1 | awk '{print $NF}')
+      R_IP=$(echo "$DIG_RES" | awk '/^;; ANSWER SECTION:/{flag=1;next} /^$/{flag=0} flag && $4=="A"{print $5; exit}')
 
       if [ -n "$R_IP" ] && [[ "$R_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo -e "${GREEN}成功${PLAIN} -> IP: ${CYAN}${R_IP}${PLAIN} | 延迟: ${YELLOW}${Q_TIME}${PLAIN}"
@@ -479,10 +494,11 @@ check_connection() {
 
   echo -n "[1/4] 检查本地 127.0.0.1:53 监听状态: "
   PORT_INFO=$(ss -tulpn 2>/dev/null | grep -E ":53\b" || lsof -i :53 -n -P 2>/dev/null || true)
-  if [ -n "$PORT_INFO" ]; then
-    RUN_NAME=$(echo "$PORT_INFO" | grep -oE "dnsproxy|cloudflared" | head -n 1)
-    RUN_NAME=${RUN_NAME:-"本地DNS服务"}
+  RUN_NAME=$(echo "$PORT_INFO" | grep -oE "dnsproxy|cloudflared" | head -n 1 || true)
+  if [ -n "$RUN_NAME" ]; then
     echo -e "${GREEN}正常${PLAIN} (正在由 ${CYAN}${RUN_NAME}${PLAIN} 提供服务)"
+  elif [ -n "$PORT_INFO" ]; then
+    echo -e "${YELLOW}异常！53 端口被其他进程占用 (非 dnsproxy/cloudflared)${PLAIN}"
   else
     echo -e "${RED}异常！未检测到 DoH 服务监听 53 端口${PLAIN}"
   fi
@@ -518,9 +534,9 @@ check_connection() {
   TEST_DOMAIN="google.com"
 
   if command -v dig &>/dev/null; then
-    DIG_RESULT=$(dig @127.0.0.1 ${TEST_DOMAIN} +time=3 +tries=1 +stats 2>/dev/null || true)
+    DIG_RESULT=$(dig @127.0.0.1 ${TEST_DOMAIN} A +time=3 +tries=2 +stats 2>/dev/null || true)
     QUERY_TIME=$(echo "$DIG_RESULT" | grep "Query time:" | awk '{print $4, $5}')
-    RESOLVED_IP=$(echo "$DIG_RESULT" | grep -A 1 "ANSWER SECTION:" | tail -n 1 | awk '{print $NF}')
+    RESOLVED_IP=$(echo "$DIG_RESULT" | awk '/^;; ANSWER SECTION:/{flag=1;next} /^$/{flag=0} flag && $4=="A"{print $5; exit}')
 
     if [ -n "$RESOLVED_IP" ] && [[ "$RESOLVED_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo -e "  - 解析状态: ${GREEN}成功${PLAIN}"
@@ -557,6 +573,7 @@ uninstall_all() {
   systemctl daemon-reload
   rm -f /usr/local/bin/dnsproxy /usr/local/bin/cloudflared
 
+  chattr -i /etc/resolv.conf 2>/dev/null || true
   cat << RESOLV_EOF > /etc/resolv.conf
 nameserver 1.1.1.1
 nameserver 8.8.8.8
@@ -564,51 +581,57 @@ RESOLV_EOF
   echo -e "${GREEN}[+] 卸载完成，系统 DNS 已重置为 1.1.1.1 / 8.8.8.8。${PLAIN}"
 }
 
-clear
-echo -e "${CYAN}=======================================================${PLAIN}"
-echo -e "${CYAN}          低内存 DoH 客户端集成部署管理脚本          ${PLAIN}"
-echo -e "${CYAN}=======================================================${PLAIN}"
-echo " 1. 部署 dnsproxy    [最推荐 / 内存~10MB / 并发竞速模式]"
-echo " 2. 部署 cloudflared [官方客户端 / 内存~25MB / 稳定直链已锁版]"
-echo " -----------------------------------------------------"
-echo " 3. 批量测试全部 13 个 DoH 节点延迟 (基准跑分)"
-echo " 4. 检测本机 DNS 连通性与测速 (多域名梯队延迟)"
-echo " 5. 深度检测 DoH 综合服务状态 (端口/上游/系统全面排错)"
-echo " 6. 卸载全部 DoH 工具并恢复默认配置"
-echo " 0. 退出脚本"
-echo -e "${CYAN}=======================================================${PLAIN}"
-read -rp "请选择模式 [0-6]: " main_choice
+# ================= 主菜单循环 =================
+while true; do
+  clear
+  echo -e "${CYAN}=======================================================${PLAIN}"
+  echo -e "${CYAN}          低内存 DoH 客户端集成部署管理脚本          ${PLAIN}"
+  echo -e "${CYAN}=======================================================${PLAIN}"
+  echo " 1. 部署 dnsproxy    [最推荐 / 内存~10MB / 并发竞速模式]"
+  echo " 2. 部署 cloudflared [官方客户端 / 内存~25MB / 稳定直链已锁版]"
+  echo " -----------------------------------------------------"
+  echo " 3. 批量测试全部 13 个 DoH 节点延迟 (基准跑分)"
+  echo " 4. 检测本机 DNS 连通性与测速 (多域名梯队延迟)"
+  echo " 5. 深度检测 DoH 综合服务状态 (端口/上游/系统全面排错)"
+  echo " 6. 卸载全部 DoH 工具并恢复默认配置"
+  echo " 0. 退出脚本"
+  echo -e "${CYAN}=======================================================${PLAIN}"
+  read -rp "请选择模式 [0-6]: " main_choice
 
-install_deps
-
-case "$main_choice" in
-  1)
-    deploy_dnsproxy
-    sleep 1
-    test_dns_connectivity
-    ;;
-  2)
-    deploy_cloudflared
-    sleep 1
-    test_dns_connectivity
-    ;;
-  3)
-    benchmark_all_doh
-    ;;
-  4)
-    test_dns_connectivity
-    ;;
-  5)
-    check_connection
-    ;;
-  6)
-    uninstall_all
-    ;;
-  0)
-    exit 0
-    ;;
-  *)
-    echo -e "${RED}[-] 无效输入，退出。${PLAIN}"
-    exit 1
-    ;;
-esac
+  case "$main_choice" in
+    1)
+      deploy_dnsproxy
+      sleep 2
+      test_dns_connectivity "no_clear"
+      break
+      ;;
+    2)
+      deploy_cloudflared
+      sleep 2
+      test_dns_connectivity "no_clear"
+      break
+      ;;
+    3)
+      benchmark_all_doh
+      ;;
+    4)
+      test_dns_connectivity
+      break
+      ;;
+    5)
+      check_connection
+      break
+      ;;
+    6)
+      uninstall_all
+      break
+      ;;
+    0)
+      exit 0
+      ;;
+    *)
+      echo -e "${RED}[-] 无效输入，请重新选择。${PLAIN}"
+      sleep 1
+      ;;
+  esac
+done
